@@ -74,6 +74,10 @@
     {
       "source": "/chain-abstraction/meta-transactions",
       "destination": "/protocol/transactions/meta-tx"
+    },
+    {
+      "source": "/api/rpc/maintenance-windows",
+      "destination": "/api-reference/maintenance-windows"
     }
   ],
   "navigation": {
@@ -330,7 +334,7 @@
                       }
                     ]
                   }
-              ]
+                ]
               },
               {
                 "group": "Multi-Chain",
