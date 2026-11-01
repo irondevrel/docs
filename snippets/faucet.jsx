@@ -9,18 +9,117 @@ export const Faucet = () => {
     setErrorMsg('')
 
     try {
-      const response = await fetch('https://docs-mcp-f18b.onrender.com/api/faucet', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ accountId }),
-      })
-
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        throw new Error(data.message || 'Request failed')
+      const beneficiary = accountId.trim()
+      if (!/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(beneficiary) || beneficiary.length < 2 || beneficiary.length > 64) {
+        throw new Error('Please provide a valid account ID')
       }
 
+      const concat = (...parts) => new Uint8Array(parts.flatMap((part) => Array.from(part)))
+      // Borsh integers are little-endian; strings have a u32 byte-length prefix.
+      const integer = (value, size) => {
+        let remaining = BigInt(value)
+        return Uint8Array.from({ length: size }, () => {
+          const byte = Number(remaining & BigInt(255))
+          remaining >>= BigInt(8)
+          return byte
+        })
+      }
+      const string = (value) => {
+        const bytes = new TextEncoder().encode(value)
+        return concat(integer(bytes.length, 4), bytes)
+      }
+      const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+      const base58Encode = (bytes) => {
+        let value = BigInt(0)
+        for (const byte of bytes) value = value * BigInt(256) + BigInt(byte)
+        let encoded = ''
+        while (value > BigInt(0)) {
+          encoded = alphabet[Number(value % BigInt(58))] + encoded
+          value /= BigInt(58)
+        }
+        for (const byte of bytes) {
+          if (byte !== 0) break
+          encoded = '1' + encoded
+        }
+        return encoded
+      }
+      const base58Decode = (encoded) => {
+        let value = BigInt(0)
+        for (const char of encoded) {
+          const digit = alphabet.indexOf(char)
+          if (digit < 0) throw new Error('Invalid base58 block hash')
+          value = value * BigInt(58) + BigInt(digit)
+        }
+        const bytes = []
+        while (value > BigInt(0)) {
+          bytes.unshift(Number(value & BigInt(255)))
+          value >>= BigInt(8)
+        }
+        for (const char of encoded) {
+          if (char !== '1') break
+          bytes.unshift(0)
+        }
+        return new Uint8Array(bytes)
+      }
+      const rpc = async (method, params) => {
+        const response = await fetch('https://rpc.testnet.near.org', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 'faucet', method, params }),
+        })
+        if (!response.ok) throw new Error(`RPC request failed (${response.status})`)
+        const data = await response.json()
+        if (data.error) throw new Error(data.error.data || data.error.message || 'RPC request failed')
+        return data.result
+      }
+
+      const keyPair = await crypto.subtle.generateKey('Ed25519', false, ['sign', 'verify'])
+      const publicKey = new Uint8Array(await crypto.subtle.exportKey('raw', keyPair.publicKey))
+      const publicKeyStr = `ed25519:${base58Encode(publicKey)}`
+      const randomId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('')
+      const tmpAccount = `docs-${randomId}.testnet`
+
+      const response = await fetch('https://helper.testnet.near.org/account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ newAccountId: tmpAccount, newAccountPublicKey: publicKeyStr }),
+      })
+      if (!response.ok) {
+        throw new Error(`Account creation failed (${response.status}): ${await response.text()}`)
+      }
+
+      const sendAction = async (receiverId, action) => {
+        const accessKey = await rpc('query', {
+          request_type: 'view_access_key',
+          finality: 'optimistic',
+          account_id: tmpAccount,
+          public_key: publicKeyStr,
+        })
+        // Transaction V0: signer, Ed25519 key, nonce, receiver, block hash, actions.
+        const transaction = concat(
+          string(tmpAccount), new Uint8Array([0]), publicKey,
+          integer(BigInt(accessKey.nonce) + BigInt(1), 8), string(receiverId),
+          base58Decode(accessKey.block_hash), integer(1, 4), action,
+        )
+        const hash = await crypto.subtle.digest('SHA-256', transaction)
+        const signature = new Uint8Array(await crypto.subtle.sign('Ed25519', keyPair.privateKey, hash))
+        const signedTransaction = concat(transaction, new Uint8Array([0]), signature)
+        const result = await rpc('send_tx', {
+          signed_tx_base64: btoa(String.fromCharCode(...signedTransaction)),
+          wait_until: 'EXECUTED_OPTIMISTIC',
+        })
+        if (!result.status || result.status.SuccessValue === undefined) {
+          throw new Error(`Transaction failed: ${JSON.stringify(result.status)}`)
+        }
+      }
+
+      // Action tags: Transfer = 3 (u128 yoctoNEAR), DeleteAccount = 7 (beneficiary).
+      await sendAction(beneficiary, concat(new Uint8Array([3]), integer('5000000000000000000000000', 16)))
       setStatus('success')
+
+      // Cleanup runs in the background after funding succeeds.
+      sendAction(tmpAccount, concat(new Uint8Array([7]), string('testnet')))
+        .catch((error) => console.warn('Temporary faucet account cleanup failed:', error))
     } catch (err) {
       setErrorMsg(err.message || 'Something went wrong')
       setStatus('error')
