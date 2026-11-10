@@ -88,17 +88,19 @@ export const Faucet = () => {
         throw new Error(`Account creation failed (${response.status}): ${await response.text()}`)
       }
 
+      const accessKey = await rpc('query', {
+        request_type: 'view_access_key',
+        finality: 'optimistic',
+        account_id: tmpAccount,
+        public_key: publicKeyStr,
+      })
+      // Both actions use this account's key sequentially, so reuse the block hash.
+      let nonce = BigInt(accessKey.nonce) + BigInt(1)
       const sendAction = async (receiverId, action) => {
-        const accessKey = await rpc('query', {
-          request_type: 'view_access_key',
-          finality: 'optimistic',
-          account_id: tmpAccount,
-          public_key: publicKeyStr,
-        })
         // Transaction V0: signer, Ed25519 key, nonce, receiver, block hash, actions.
         const transaction = concat(
           string(tmpAccount), new Uint8Array([0]), publicKey,
-          integer(BigInt(accessKey.nonce) + BigInt(1), 8), string(receiverId),
+          integer(nonce, 8), string(receiverId),
           base58Decode(accessKey.block_hash), integer(1, 4), action,
         )
         const hash = await crypto.subtle.digest('SHA-256', transaction)
@@ -111,6 +113,7 @@ export const Faucet = () => {
         if (!result.status || result.status.SuccessValue === undefined) {
           throw new Error(`Transaction failed: ${JSON.stringify(result.status)}`)
         }
+        nonce += BigInt(1)
       }
 
       // Action tags: Transfer = 3 (u128 yoctoNEAR), DeleteAccount = 7 (beneficiary).
